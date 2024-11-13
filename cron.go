@@ -11,6 +11,7 @@ import (
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
+	clock     Clock
 	entries   []*Entry
 	chain     Chain
 	stop      chan struct{}
@@ -26,6 +27,55 @@ type Cron struct {
 	jobWaiter sync.WaitGroup
 }
 
+// Clock interface that cron can use for time.
+type Clock interface {
+    Now() time.Time
+    NewTimer(d time.Duration) *time.Timer
+}
+
+// Real clock implementation (for production)
+type RealClock struct{}
+
+func (RealClock) Now() time.Time {
+    return time.Now()
+}
+
+func (RealClock) NewTimer(d time.Duration) *time.Timer {
+    return time.NewTimer(d)
+}
+
+// Fake clock implementation
+type FakeClock struct {
+    currentTime time.Time
+    ticks       chan time.Time
+}
+
+func NewFakeClock(startTime time.Time) *FakeClock {
+    return &FakeClock{
+        currentTime: startTime,
+        ticks:       make(chan time.Time),
+    }
+}
+
+func (fc *FakeClock) Now() time.Time {
+    return fc.currentTime
+}
+
+func (fc *FakeClock) NewTimer(d time.Duration) *time.Timer {
+    // Fake the timer, send time after duration elapsed based on fake time
+    timer := time.NewTimer(d)
+    go func() {
+        <-timer.C
+        fc.currentTime = fc.currentTime.Add(d)
+        fc.ticks <- fc.currentTime
+    }()
+    return timer
+}
+
+func (fc *FakeClock) Advance(d time.Duration) {
+    fc.currentTime = fc.currentTime.Add(d)
+    fc.ticks <- fc.currentTime
+}
 // ScheduleParser is an interface for schedule spec parsers that return a Schedule
 type ScheduleParser interface {
 	Parse(spec string) (Schedule, error)
@@ -112,6 +162,7 @@ func (s byTime) Less(i, j int) bool {
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
 	c := &Cron{
+		clock:    clock,
 		entries:   nil,
 		chain:     NewChain(),
 		add:       make(chan *Entry),
@@ -128,6 +179,26 @@ func New(opts ...Option) *Cron {
 		opt(c)
 	}
 	return c
+}
+
+
+func NewWithClock(clock Clock) *Cron {
+    c := &Cron{
+		entries:   nil,
+		chain:     NewChain(),
+		add:       make(chan *Entry),
+		stop:      make(chan struct{}),
+		snapshot:  make(chan chan []Entry),
+		remove:    make(chan EntryID),
+		running:   false,
+		runningMu: sync.Mutex{},
+		logger:    DefaultLogger,
+		location:  time.Local,
+		parser:    standardParser,
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
 }
 
 // FuncJob is a wrapper that turns a func() into a cron.Job
@@ -240,7 +311,7 @@ func (c *Cron) run() {
 	c.logger.Info("start")
 
 	// Figure out the next activation times for each entry.
-	now := c.now()
+	now := c.clock.Now()  
 	for _, entry := range c.entries {
 		entry.Next = entry.Schedule.Next(now)
 		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
@@ -254,9 +325,9 @@ func (c *Cron) run() {
 		if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
 			// If there are no entries yet, just sleep - it still handles new entries
 			// and stop requests.
-			timer = time.NewTimer(100000 * time.Hour)
+			timer = c.clock.NewTimer(100000 * time.Hour)
 		} else {
-			timer = time.NewTimer(c.entries[0].Next.Sub(now))
+			timer = c.clock.NewTimer(c.entries[0].Next.Sub(now))
 		}
 
 		for {
